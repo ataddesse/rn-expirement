@@ -288,6 +288,18 @@ export class BertTokenizer {
 
     return outputTokens;
   }
+
+  /**
+   * Decode the token IDs back to text.
+   * @param tokenIds array of token IDs to be decoded.
+   */
+  async decode(tokenIds: number[]): Promise<string> {
+    const words = tokenIds.map((id) => this.vocab[id]);
+    return words
+      .join(' ')
+      .replace(new RegExp(SEPERATOR, 'g'), '') // Remove the separator token.
+      .trim();
+  }
 }
 
 export async function loadTokenizer(): Promise<BertTokenizer> {
