@@ -77,13 +77,25 @@ export class TransformerOps {
   }
 
   /**
-   * Decode valid spans based on start and end logits, while ensuring constraints.
+   * Mask undesired tokens by setting their logits to a large negative value.
+   * 
+   * @param logits - The logits array.
+   * @param undesiredTokens - A binary array indicating undesired token positions.
+   * @returns - Logits array with undesired tokens masked.
+   */
+  maskUndesiredTokens(logits: Float32Array, undesiredTokens: Uint8Array): Float32Array {
+    return logits.map((logit, idx) => undesiredTokens[idx] === 1 ? -10000.0 : logit);
+  }
+
+  /**
+   * Decode valid spans based on start and end logits, ensuring span constraints.
    * 
    * @param startLogits - Softmaxed start logits.
    * @param endLogits - Softmaxed end logits.
+   * @param topk - Number of top spans to consider.
    * @param maxAnswerLength - The maximum answer length.
-   * @param undesiredTokens - Mask to filter out invalid tokens (e.g., padding or [CLS]).
-   * @returns - The best start, end positions and corresponding score.
+   * @param undesiredTokens - Mask to filter out invalid tokens.
+   * @returns - The best start, end positions and their corresponding score.
    */
   decodeSpans(
     startLogits: Float32Array, 
@@ -106,7 +118,7 @@ export class TransformerOps {
     const candidates = outer.map((val, idx) => {
       const startIdx = Math.floor(idx / endLogits.length);
       const endIdx = idx % endLogits.length;
-      return (endIdx >= startIdx && endIdx - startIdx < maxAnswerLength) ? val : -Infinity;
+      return (endIdx >= startIdx && endIdx - startIdx < maxAnswerLength && undesiredTokens[startIdx] === 0 && undesiredTokens[endIdx] === 0) ? val : -Infinity;
     });
 
     // Find top-k spans by sorting candidates
@@ -121,30 +133,27 @@ export class TransformerOps {
     const starts = idxSort.map(idx => Math.floor(idx / endLogits.length));
     const ends = idxSort.map(idx => idx % endLogits.length);
 
-    // Filter out undesired tokens (e.g., [CLS], [SEP])
-    const desiredSpans = starts.map((start, idx) => undesiredTokens[start] === 0 && undesiredTokens[ends[idx]] === 0);
-    const filteredStarts = starts.filter((_, idx) => desiredSpans[idx]);
-    const filteredEnds = ends.filter((_, idx) => desiredSpans[idx]);
+    // Filter out invalid spans (should be unnecessary due to earlier filtering)
+    const validSpans = starts.filter((_, idx) => candidates[starts[idx] * endLogits.length + ends[idx]] > -Infinity);
+    const filteredStarts = validSpans.map(idx => starts[idx]);
+    const filteredEnds = validSpans.map(idx => ends[idx]);
 
     const scores = new Float32Array(filteredStarts.map((start, idx) => candidates[start * endLogits.length + filteredEnds[idx]]));
 
     return { starts: filteredStarts, ends: filteredEnds, scores };
   }
 
-  /**
-   * Main function to run inference on a question and context.
-   * 
-   * @param question - The question string.
-   * @param context - The context string where the answer is searched.
-   * @returns - The extracted answer or null if not found.
-   */
   public async runInference(question: string): Promise<string | null> {
     const context = `Austin is the Capital of Texas`;
     try {
       // Tokenize the question and context
       const tokenizedQuestion = this.tokenizer!.tokenize(question);
       const tokenizedContext = this.tokenizer!.tokenize(context);
-
+  
+      // Log tokenized input
+      console.log("Tokenized Question: ", tokenizedQuestion);
+      console.log("Tokenized Context: ", tokenizedContext);
+  
       // Create input sequence with [CLS], [SEP], etc.
       const inputTokens = [
         CLS_INDEX, 
@@ -153,46 +162,69 @@ export class TransformerOps {
         ...tokenizedContext, 
         SEP_INDEX
       ];
-
+  
       // Create ONNX input tensors
       const onnxInput = await createModelInput(inputTokens);
-
+  
       // Run the model and get start and end logits
       const modelResponse: InferenceSession.ReturnType = await this.onnxModel!.run(onnxInput);
+  
+      // Log model response
+      console.log("Model Response: ", modelResponse);
+  
       const startLogitsTensor = modelResponse["start_logits"] as TypedTensor<"float32">;
       const endLogitsTensor = modelResponse["end_logits"] as TypedTensor<"float32">;
-
-      const startLogits = this.softmax(startLogitsTensor.data);
-      const endLogits = this.softmax(endLogitsTensor.data);
-
+  
+      // Log logits before softmax
+      console.log("Start Logits (raw): ", startLogitsTensor.data);
+      console.log("End Logits (raw): ", endLogitsTensor.data);
+  
+      const startLogits = startLogitsTensor.data;
+      const endLogits = endLogitsTensor.data;
+  
       // Create undesired tokens mask (e.g., CLS, SEP, and padding tokens)
       const undesiredTokens = new Uint8Array(inputTokens.length);
       undesiredTokens.fill(0);
       undesiredTokens[0] = 1; // Mark CLS as undesired
       undesiredTokens[tokenizedQuestion.length + 1] = 1; // Mark first SEP as undesired
       undesiredTokens[tokenizedQuestion.length + tokenizedContext.length + 2] = 1; // Mark second SEP as undesired
-
-      const bestSpan = this.decodeSpans(startLogits, endLogits, 1, 30, undesiredTokens);
-
+  
+      // Mask undesired tokens by setting their logits to a large negative value before softmax
+      const maskedStartLogits = this.maskUndesiredTokens(startLogits, undesiredTokens);
+      const maskedEndLogits = this.maskUndesiredTokens(endLogits, undesiredTokens);
+  
+      // Softmax normalization after masking undesired tokens
+      const startProbs = this.softmax(maskedStartLogits);
+      const endProbs = this.softmax(maskedEndLogits);
+  
+      // Log softmax results
+      console.log("Softmax: startProbs: ", startProbs);
+      console.log("Softmax: endProbs: ", endProbs);
+  
+      // Decode the best spans with filtering based on valid constraints
+      const bestSpan = this.decodeSpans(startProbs, endProbs, 1, 30, undesiredTokens);
+  
       if (!bestSpan || bestSpan.starts.length === 0 || bestSpan.ends.length === 0) {
         console.error("No valid answer found");
         return null;
       }
-
+  
+      // Log the best span
+      console.log("Best Span: ", bestSpan.starts[0], bestSpan.ends[0]);
+  
       // Extract the tokens within the best span
       const answerTokens = inputTokens.slice(bestSpan.starts[0], bestSpan.ends[0] + 1);
-
-      // Decode the answer tokens back to string, excluding any special tokens
+  
+      console.log("Answer Tokens: ", answerTokens);
+  
       const answer = this.tokenizer!.decode(answerTokens.filter(token => token !== SEP_INDEX && token !== CLS_INDEX));
-
-      console.log("Best span: ", bestSpan.starts[0], bestSpan.ends[0]);
-      console.log("Answer tokens: ", answerTokens);
-      console.log("Answer final: ", answer);
+  
+      console.log("Final Answer: ", answer);
       
       return answer;
     } catch (error) {
       console.error("TransformerOps: Failed to process question", error);
       return null;
     }
-  }
+  }  
 }
