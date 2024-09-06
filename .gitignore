@@ -33,5 +33,3 @@ yarn-error.*
 
 # typescript
 *.tsbuildinfo
-assets/distil/*.onnx
-assets/distil-squad/*.onnx
