@@ -2,7 +2,12 @@ import { Asset } from "expo-asset";
 import { InferenceSession, TypedTensor } from "onnxruntime-react-native";
 import { createModelInput } from "./tokenizer/BertProcessor";
 import { BertTokenizer, CLS_INDEX, SEP_INDEX, loadTokenizer } from "./tokenizer/BertTokenizer";
-
+import { SEP_TOKEN } from "./assets/tokenizer/BertTokenizer";
+type TokenizeOptions = {
+  padding?: boolean;
+  truncation?: boolean;
+  maxLength?: number;
+};
 export class TransformerOpsInitException extends Error {
   constructor(message: string) {
     super(message);
@@ -63,168 +68,180 @@ export class TransformerOps {
     return model;
   }
 
-  /**
-   * Utility function to apply softmax to logits.
-   * 
-   * @param logits - The logits array.
-   * @returns - Softmax probabilities.
-   */
-  softmax(logits: Float32Array): Float32Array {
-    const maxLogit = Math.max(...logits);
-    const exps = logits.map(logit => Math.exp(logit - maxLogit));
-    const sumExps = exps.reduce((a, b) => a + b);
-    return exps.map(exp => exp / sumExps);
-  }
+  max(arr) {
+    if (arr.length === 0) throw Error('Array must not be empty');
+    let max = arr[0];
+    let indexOfMax = 0;
+    for (let i = 1; i < arr.length; ++i) {
+        if (arr[i] > max) {
+            max = arr[i];
+            indexOfMax = i;
+        }
+    }
+    return [Number(max), indexOfMax];
+}
 
-  /**
-   * Mask undesired tokens by setting their logits to a large negative value.
-   * 
-   * @param logits - The logits array.
-   * @param undesiredTokens - A binary array indicating undesired token positions.
-   * @returns - Logits array with undesired tokens masked.
-   */
-  maskUndesiredTokens(logits: Float32Array, undesiredTokens: Uint8Array): Float32Array {
-    return logits.map((logit, idx) => undesiredTokens[idx] === 1 ? -10000.0 : logit);
-  }
+  softmax(arr) {
+    // Compute the maximum value in the array
+    const maxVal = this.max(arr)[0];
 
-  /**
-   * Decode valid spans based on start and end logits, ensuring span constraints.
-   * 
-   * @param startLogits - Softmaxed start logits.
-   * @param endLogits - Softmaxed end logits.
-   * @param topk - Number of top spans to consider.
-   * @param maxAnswerLength - The maximum answer length.
-   * @param undesiredTokens - Mask to filter out invalid tokens.
-   * @returns - The best start, end positions and their corresponding score.
-   */
-  decodeSpans(
-    startLogits: Float32Array, 
-    endLogits: Float32Array, 
-    topk: number, 
-    maxAnswerLength: number, 
-    undesiredTokens: Uint8Array
-  ): { starts: number[], ends: number[], scores: Float32Array } | null {
+    // Compute the exponentials of the array values
+    const exps = arr.map(x => Math.exp(x - maxVal));
 
-    const outer = new Float32Array(startLogits.length * endLogits.length);
+    // Compute the sum of the exponentials
+    // @ts-ignore
+    const sumExps = exps.reduce((acc, val) => acc + val, 0);
 
-    // Compute the score of each tuple(start, end) as outer product
-    for (let i = 0; i < startLogits.length; i++) {
-      for (let j = 0; j < endLogits.length; j++) {
-        outer[i * endLogits.length + j] = startLogits[i] * endLogits[j];
+    // Compute the softmax values
+    const softmaxArr = exps.map(x => x / sumExps);
+
+    return /** @type {T} */(softmaxArr);
+}
+
+product(array1: Array<any>, array2: Array<any>): Array<[any, any]> {
+  const result: Array<[any, any]> = [];
+  for (let item1 of array1) {
+      for (let item2 of array2) {
+          result.push([item1, item2]);
       }
+  }
+  return result;
+}
+
+tokenizeQuestionAndContext(
+  tokenize: (text: string, options?: TokenizeOptions) => string[],
+  question: string,
+  context: string,
+  options: TokenizeOptions = {}
+) {
+  // Default options for tokenization
+  const { padding = true, truncation = true, maxLength = 512 } = options;
+
+  // Tokenize question and context as a text pair
+  let questionTokens = this.tokenizer!.tokenize(question);
+  let contextTokens = this.tokenizer!.tokenize(context);
+
+  // Add special tokens if required (this example assumes a BERT-like model)
+  const clsToken = '[CLS]';
+  const sepToken = '[SEP]';
+
+  // Construct token sequence: [CLS] question tokens [SEP] context tokens [SEP]
+  const inputTokens = [clsToken, ...questionTokens, sepToken, ...contextTokens, sepToken];
+
+  // If truncation is enabled, truncate question and context tokens
+  if (truncation) {
+    const totalLength = questionTokens.length + contextTokens.length + 3; // Adding 3 for [CLS] and [SEP] tokens
+    if (totalLength > maxLength) {
+        // Allocate space for question and context based on proportion
+        const questionLength = Math.floor((maxLength - 3) * 0.5); // Allow half the space for question
+        const contextLength = maxLength - 3 - questionLength; // Remaining for context
+        questionTokens = questionTokens.slice(0, questionLength);
+        contextTokens = contextTokens.slice(0, contextLength);
     }
+}
 
-    // Remove invalid candidates where end < start or end - start > maxAnswerLength
-    const candidates = outer.map((val, idx) => {
-      const startIdx = Math.floor(idx / endLogits.length);
-      const endIdx = idx % endLogits.length;
-      return (endIdx >= startIdx && endIdx - startIdx < maxAnswerLength && undesiredTokens[startIdx] === 0 && undesiredTokens[endIdx] === 0) ? val : -Infinity;
-    });
-
-    // Find top-k spans by sorting candidates
-    const scoresFlat = Array.from(candidates);
-    let idxSort: number[];
-    if (topk === 1) {
-      idxSort = [scoresFlat.indexOf(Math.max(...scoresFlat))];
-    } else {
-      idxSort = Array.from(scoresFlat.keys()).sort((a, b) => scoresFlat[b] - scoresFlat[a]).slice(0, topk);
-    }
-
-    const starts = idxSort.map(idx => Math.floor(idx / endLogits.length));
-    const ends = idxSort.map(idx => idx % endLogits.length);
-
-    // Filter out invalid spans (should be unnecessary due to earlier filtering)
-    const validSpans = starts.filter((_, idx) => candidates[starts[idx] * endLogits.length + ends[idx]] > -Infinity);
-    const filteredStarts = validSpans.map(idx => starts[idx]);
-    const filteredEnds = validSpans.map(idx => ends[idx]);
-
-    const scores = new Float32Array(filteredStarts.map((start, idx) => candidates[start * endLogits.length + filteredEnds[idx]]));
-
-    return { starts: filteredStarts, ends: filteredEnds, scores };
+  // Apply padding if necessary
+  if (padding) {
+      const maxLength = options.maxLength || 512; // Adjust this based on model's max input length
+      while (inputTokens.length < maxLength) {
+          inputTokens.push('[PAD]');
+      }
   }
 
-  public async runInference(question: string): Promise<string | null> {
-    const context = `Austin is the Capital of Texas`;
-    try {
-      // Tokenize the question and context
+  return inputTokens;
+}
+public async runInference(question: string, topk = 1): Promise<any> {
+  const context = `
+  
+Save 3% on all your Apple purchases with Apple Card.1 Apply and use in minutes2
+APPLE ACCOUNT
+amanueltaddesse19@gmail.com	BILLED TO
+Visa .... 5006
+Amanuel Taddesse
+5100 Gadsden Ave
+Keller , TX 76244
+USA
+DATE
+Aug 31, 2024
+ORDER ID
+MSHLQYB2M8	DOCUMENT NO.
+206845010900
+App Store
+	Peacock TV: Stream TV & Movies
+Peacock Premium (Monthly)
+Renews Sep 27, 2024
+Report a Problem	
+$7.99
+Subtotal	 	$7.99
+ 
+Tax	 	$0.66
+TOTAL		$8.65
+ 
+Apple Card
+Save 3% on all your Apple purchases.
+Apply and use in minutes
+ 
+
+  `;  // Example context
+  try {
       const tokenizedQuestion = this.tokenizer!.tokenize(question);
       const tokenizedContext = this.tokenizer!.tokenize(context);
-  
-      // Log tokenized input
-      console.log("Tokenized Question: ", tokenizedQuestion);
-      console.log("Tokenized Context: ", tokenizedContext);
-  
-      // Create input sequence with [CLS], [SEP], etc.
-      const inputTokens = [
-        CLS_INDEX, 
-        ...tokenizedQuestion, 
-        SEP_INDEX, 
-        ...tokenizedContext, 
-        SEP_INDEX
+      const inputs = [
+        CLS_INDEX,        
+          ...tokenizedQuestion, 
+          SEP_INDEX, 
+          ...tokenizedContext, 
+          SEP_INDEX
       ];
-  
+
       // Create ONNX input tensors
-      const onnxInput = await createModelInput(inputTokens);
-  
+      const input = await createModelInput(inputs);
+
       // Run the model and get start and end logits
-      const modelResponse: InferenceSession.ReturnType = await this.onnxModel!.run(onnxInput);
-  
-      // Log model response
-      console.log("Model Response: ", modelResponse);
-  
-      const startLogitsTensor = modelResponse["start_logits"] as TypedTensor<"float32">;
-      const endLogitsTensor = modelResponse["end_logits"] as TypedTensor<"float32">;
-  
-      // Log logits before softmax
-      console.log("Start Logits (raw): ", startLogitsTensor.data);
-      console.log("End Logits (raw): ", endLogitsTensor.data);
-  
-      const startLogits = startLogitsTensor.data;
-      const endLogits = endLogitsTensor.data;
-  
-      // Create undesired tokens mask (e.g., CLS, SEP, and padding tokens)
-      const undesiredTokens = new Uint8Array(inputTokens.length);
-      undesiredTokens.fill(0);
-      undesiredTokens[0] = 1; // Mark CLS as undesired
-      undesiredTokens[tokenizedQuestion.length + 1] = 1; // Mark first SEP as undesired
-      undesiredTokens[tokenizedQuestion.length + tokenizedContext.length + 2] = 1; // Mark second SEP as undesired
-  
-      // Mask undesired tokens by setting their logits to a large negative value before softmax
-      const maskedStartLogits = this.maskUndesiredTokens(startLogits, undesiredTokens);
-      const maskedEndLogits = this.maskUndesiredTokens(endLogits, undesiredTokens);
-  
-      // Softmax normalization after masking undesired tokens
-      const startProbs = this.softmax(maskedStartLogits);
-      const endProbs = this.softmax(maskedEndLogits);
-  
-      // Log softmax results
-      console.log("Softmax: startProbs: ", startProbs);
-      console.log("Softmax: endProbs: ", endProbs);
-  
-      // Decode the best spans with filtering based on valid constraints
-      const bestSpan = this.decodeSpans(startProbs, endProbs, 1, 30, undesiredTokens);
-  
-      if (!bestSpan || bestSpan.starts.length === 0 || bestSpan.ends.length === 0) {
-        console.error("No valid answer found");
-        return null;
-      }
-  
-      // Log the best span
-      console.log("Best Span: ", bestSpan.starts[0], bestSpan.ends[0]);
-  
-      // Extract the tokens within the best span
-      const answerTokens = inputTokens.slice(bestSpan.starts[0], bestSpan.ends[0] + 1);
-  
-      console.log("Answer Tokens: ", answerTokens);
-  
-      const answer = this.tokenizer!.decode(answerTokens.filter(token => token !== SEP_INDEX && token !== CLS_INDEX));
-  
-      console.log("Final Answer: ", answer);
-      
-      return answer;
-    } catch (error) {
+      const output: InferenceSession.ReturnType = await this.onnxModel!.run(input);
+      console.log("Model response: ", output);
+
+      console.log("Model response: ", output);
+
+    /** @type {QuestionAnsweringOutput[]} */
+    const toReturn = [];
+    for (let j = 0; j < output.start_logits.dims[0]; ++j) {
+        const sepIndex:number = SEP_INDEX;
+
+        // Extract start and end logits from cpuData
+        const s1 = Array.from(this.softmax(output.start_logits.cpuData))
+            .map((x, i) => [x, i])
+            .filter(x => (x[1] as number) > 6);
+        const e1 = Array.from(this.softmax(output.end_logits.cpuData))
+            .map((x, i) => [x, i])
+            .filter(x => (x[1] as number) > 6);
+
+        console.log("S1 and E1", s1, e1);
+
+        const options = this.product(s1, e1)
+            .filter(x => x[0][1] <= x[1][1])
+            .map(x => [x[0][1], x[1][1], x[0][0] * x[1][0]])
+            .sort((a, b) => b[2] - a[2]);
+
+        for (let k = 0; k < Math.min(options.length, topk); ++k) {
+            let [start, end, score] = options[k];
+            const start_ = start - 1;
+            const end_ = end - 1;
+            const answer_tokens = [...inputs].slice(start_, end_ + 1);
+
+            const answer = this.tokenizer.decode(answer_tokens);
+
+           // TODO add start and end?
+                // NOTE: HF returns character index
+                toReturn.push({
+                  answer, score
+              });
+        }
+    }
+    return (topk === 1) ? toReturn[0].answer : toReturn;
+  } catch (error) {
       console.error("TransformerOps: Failed to process question", error);
       return null;
-    }
-  }  
+  }
+  }
 }

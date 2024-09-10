@@ -24,7 +24,7 @@ const SEPERATOR = '\u2581';
 export const UNK_INDEX = 100;
 export const CLS_INDEX = 101;
 export const CLS_TOKEN = '[CLS]';
-export const SEP_INDEX = 102;
+export const SEP_INDEX : number = 102;
 export const SEP_TOKEN = '[SEP]';
 export const NFKC_TOKEN = 'NFKC';
 export const VOCAB_URL = '../assets/st/vocab.json';
@@ -293,12 +293,34 @@ export class BertTokenizer {
    * Decode the token IDs back to text.
    * @param tokenIds array of token IDs to be decoded.
    */
-  async decode(tokenIds: number[]): Promise<string> {
+  async decode(tokenIds: number[], skipSpecialTokens: boolean = true): Promise<string> {
+    // Convert token IDs to tokens using a vocabulary map
+    const specialTokens = require("../assets/distil-quad/special_tokens_map.json");
     const words = tokenIds.map((id) => this.vocab[id]);
-    return words
+
+    // Convert specialTokens object values into an array for easy lookup
+    const specialTokensArray = Object.values(specialTokens);
+
+    // Remove special tokens if the option is enabled
+    const filteredWords = skipSpecialTokens
+      ? words.filter((word) => !specialTokensArray.includes(word)) // Check if the word is not a special token
+      : words;
+
+    // Handle subwords (e.g., BERT-style subwords prefixed with '##')
+    const decodedString = filteredWords
+      .map((word, index) => {
+        if (index > 0 && word.startsWith('##')) {
+          // Join subwords without a space for BERT-style tokenizers
+          return word.slice(2);
+        } else {
+          // Join regular words with a space
+          return word;
+        }
+      })
       .join(' ')
-      .replace(new RegExp(SEPERATOR, 'g'), '') // Remove the separator token.
-      .trim();
+      .trim(); // Trim leading/trailing spaces
+
+    return decodedString;
   }
 }
 

@@ -27,6 +27,8 @@ export const CLS_TOKEN = '[CLS]';
 export const SEP_INDEX = 102;
 export const SEP_TOKEN = '[SEP]';
 export const NFKC_TOKEN = 'NFKC';
+export const PAD_INDEX = 0; // Add padding index
+export const PAD_TOKEN = '[PAD]'; // Add padding token
 export const VOCAB_URL = '../assets/st/vocab.json';
 import vocab from '../../assets/st/vocab.json';
 
